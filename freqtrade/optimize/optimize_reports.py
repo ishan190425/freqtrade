@@ -8,11 +8,13 @@ from numpy import int64
 from pandas import DataFrame
 from tabulate import tabulate
 
+import math
+
 from freqtrade.constants import DATETIME_PRINT_FORMAT, LAST_BT_RESULT_FN, UNLIMITED_STAKE_AMOUNT
 from freqtrade.data.btanalysis import (calculate_csum, calculate_market_change,
                                        calculate_max_drawdown)
 from freqtrade.misc import decimals_per_coin, file_dump_json, round_coin_value
-
+from pandas import DataFrame, date_range
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,7 @@ def _generate_result_line(result: DataFrame, starting_balance: int, first_column
         'wins': len(result[result['profit_abs'] > 0]),
         'draws': len(result[result['profit_abs'] == 0]),
         'losses': len(result[result['profit_abs'] < 0]),
+
     }
 
 
@@ -109,9 +112,6 @@ def generate_pair_metrics(data: Dict[str, Dict], stake_currency: str, starting_b
             continue
 
         tabular_data.append(_generate_result_line(result, starting_balance, pair))
-
-    # Sort by total profit %:
-    tabular_data = sorted(tabular_data, key=lambda k: k['profit_total_abs'], reverse=True)
 
     # Append Total
     tabular_data.append(_generate_result_line(results, starting_balance, 'TOTAL'))
@@ -277,7 +277,70 @@ def generate_backtest_stats(btdata: Dict[str, DataFrame],
         results['open_timestamp'] = results['open_date'].astype(int64) // 1e6
         results['close_timestamp'] = results['close_date'].astype(int64) // 1e6
 
+        resample_freq = '5m'
+        slippage_per_trade_ratio = 0.0005
+        days_in_year = 365
+        annual_risk_free_rate = 0.0
+        risk_free_rate = annual_risk_free_rate / days_in_year
         backtest_days = (max_date - min_date).days
+        # apply slippage per trade to profit_ratio
+        results.loc[:, 'profit_ratio_after_slippage'] = \
+            results['profit_ratio'] - slippage_per_trade_ratio
+
+        # create the index within the min_date and end max_date
+        t_index = date_range(start=min_date.datetime, end=max_date.datetime,
+            freq=resample_freq,normalize=True)
+
+        sum_daily = (
+            results.resample(resample_freq, on='close_date').agg(
+                {"profit_ratio_after_slippage": sum}).reindex(t_index).fillna(0)
+        )
+
+        total_profit = sum_daily["profit_ratio_after_slippage"] - risk_free_rate
+        expected_returns_mean = total_profit.mean()
+        up_stdev = total_profit.std()
+
+        sharp_ratio = expected_returns_mean / up_stdev * math.sqrt(days_in_year)
+
+        total_profit_yearly = results["profit_ratio"]
+        days_period_yearly = (max_date - min_date).days
+
+        # adding slippage of 0.1% per trade
+        total_profit_yearly = total_profit_yearly - 0.0005
+        expected_returns_mean_yearly = total_profit_yearly.sum() / days_period_yearly
+        up_stdev_yearly = total_profit_yearly.std()
+
+        sharp_ratio_yearly = expected_returns_mean_yearly / up_stdev_yearly * math.sqrt(365)
+
+
+
+        sum_daily = (
+            results.resample(resample_freq, on='close_date').agg(
+                {"profit_ratio_after_slippage": sum}).reindex(t_index).fillna(0)
+        )
+
+        expected_returns_mean = total_profit.mean()
+        sum_daily['downside_returns'] = 0
+        sum_daily.loc[total_profit < 0, 'downside_returns'] = total_profit
+        total_downside = sum_daily['downside_returns']
+        # Here total_downside contains min(0, P - MAR) values,
+        # where P = sum_daily["profit_ratio_after_slippage"]
+        down_stdev_daily = math.sqrt((total_downside**2).sum() / len(total_downside))
+        sortino_ratio_daily = expected_returns_mean / down_stdev_daily * math.sqrt(days_in_year)
+
+        total_profit = results["profit_ratio"]
+        days_period = (max_date - min_date).days
+
+        # adding slippage of 0.1% per trade
+        total_profit = total_profit - 0.0005
+        expected_returns_mean = total_profit.sum() / days_period
+
+        results['downside_returns'] = 0
+        results.loc[total_profit < 0, 'downside_returns'] = results['profit_ratio']
+        down_stdev = results['downside_returns'].std()
+
+        sortino_ratio = expected_returns_mean / down_stdev * math.sqrt(365)
+
         strat_stats = {
             'trades': results.to_dict(orient='records'),
             'locks': [lock.to_json() for lock in content['locks']],
@@ -297,6 +360,13 @@ def generate_backtest_stats(btdata: Dict[str, DataFrame],
             'backtest_end': max_date.datetime,
             'backtest_end_ts': max_date.int_timestamp * 1000,
             'backtest_days': backtest_days,
+
+
+
+            'Sharpe_Ratio': sharp_ratio,
+            'Sharpe_Ratio_Yearly': sharp_ratio_yearly,
+            'Sortino_Ratio': sortino_ratio,
+            'Sortino_Ratio_Daily': sortino_ratio_daily,
 
             'backtest_run_start_ts': content['backtest_start_time'],
             'backtest_run_end_ts': content['backtest_end_time'],
@@ -505,6 +575,13 @@ def text_table_add_metrics(strat_results: Dict) -> str:
             ('Drawdown Start', strat_results['drawdown_start'].strftime(DATETIME_PRINT_FORMAT)),
             ('Drawdown End', strat_results['drawdown_end'].strftime(DATETIME_PRINT_FORMAT)),
             ('Market change', f"{round(strat_results['market_change'] * 100, 2)}%"),
+            ('Sharpe Ratio Daily', f"{round(strat_results['Sharpe_Ratio'],2)}"),
+            ('Sharpe Ratio', f"{round(strat_results['Sharpe_Ratio_Yearly'],2)}"),
+            ('Sortino Ratio Daily', f"{round(strat_results['Sortino_Ratio_Daily'],2)}"),
+            ('Sortino Ratio', f"{round(strat_results['Sortino_Ratio'],2)}"),
+
+
+
         ]
 
         return tabulate(metrics, headers=["Metric", "Value"], tablefmt="orgtbl")
